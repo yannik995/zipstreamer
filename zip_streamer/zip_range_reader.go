@@ -187,12 +187,48 @@ func (r *ZipLayoutReader) openUpstream(entry *FileEntry, start int64, size int64
 		return fail("upstream returned status %d", resp.StatusCode)
 	}
 
-	return &limitedReadCloser{Reader: io.LimitReader(resp.Body, size-start), Closer: resp.Body}, nil
+	return &exactBody{body: resp.Body, remaining: size - start, name: entry.ZipPath()}, nil
 }
 
-type limitedReadCloser struct {
-	io.Reader
-	io.Closer
+// exactBody returns exactly the declared number of bytes of an upstream
+// body. When the declared end is reached it checks that the upstream has no
+// more data, which catches oversized bodies of unknown length (e.g. chunked
+// responses) that the Content-Length check can't detect.
+type exactBody struct {
+	body      io.ReadCloser
+	remaining int64
+	name      string
+}
+
+func (b *exactBody) Read(p []byte) (int, error) {
+	if b.remaining <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.body.Read(p)
+	b.remaining -= int64(n)
+	if b.remaining == 0 {
+		if err == nil {
+			var probe [1]byte
+			extra, probeErr := io.ReadAtLeast(b.body, probe[:], 1)
+			switch {
+			case extra > 0:
+				return n, fmt.Errorf("%s: upstream file larger than declared size", b.name)
+			case probeErr != io.EOF:
+				return n, fmt.Errorf("%s: reading upstream: %w", b.name, probeErr)
+			}
+		} else if err != io.EOF {
+			return n, err
+		}
+		return n, io.EOF
+	}
+	return n, err
+}
+
+func (b *exactBody) Close() error {
+	return b.body.Close()
 }
 
 // parseContentRange parses "bytes start-end/total". total is -1 for "*".

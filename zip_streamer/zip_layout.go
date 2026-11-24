@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"math"
 	"sort"
 	"time"
 	"unicode/utf8"
@@ -54,7 +55,10 @@ const (
 // is required for resumable (range) downloads.
 var DefaultModifiedTime = time.Date(1980, 1, 1, 0, 0, 0, 0, time.UTC)
 
-var errMissingSizeOrCRC = errors.New("size and crc32 required for every file")
+var (
+	errMissingSizeOrCRC = errors.New("size and crc32 required for every file")
+	errArchiveTooLarge  = errors.New("archive size exceeds the maximum representable size")
+)
 
 // CanBuildZipLayout reports whether all entries carry size and CRC-32.
 func CanBuildZipLayout(entries []*FileEntry) bool {
@@ -138,8 +142,13 @@ func NewZipLayout(entries []*FileEntry) (*ZipLayout, error) {
 		lh.write([]byte(name))
 		lh.write(localExtra)
 
-		l.appendStatic(&offset, lh.bytes())
+		if err := l.appendStatic(&offset, lh.bytes()); err != nil {
+			return nil, err
+		}
 		if size > 0 {
+			if size > math.MaxInt64-offset {
+				return nil, errArchiveTooLarge
+			}
 			l.segments = append(l.segments, layoutSegment{offset: offset, size: size, entry: e})
 			offset += size
 		}
@@ -218,15 +227,22 @@ func NewZipLayout(entries []*FileEntry) (*ZipLayout, error) {
 	end.uint32(uint32(centralStart))
 	end.uint16(0) // comment length
 
-	l.appendStatic(&offset, end.bytes())
+	// If this doesn't overflow, no earlier offset (e.g. zip64EndOffset) did.
+	if err := l.appendStatic(&offset, end.bytes()); err != nil {
+		return nil, err
+	}
 	l.size = offset
 	l.etag = l.computeETag()
 	return l, nil
 }
 
-func (l *ZipLayout) appendStatic(offset *int64, data []byte) {
+func (l *ZipLayout) appendStatic(offset *int64, data []byte) error {
+	if int64(len(data)) > math.MaxInt64-*offset {
+		return errArchiveTooLarge
+	}
 	l.segments = append(l.segments, layoutSegment{offset: *offset, size: int64(len(data)), data: data})
 	*offset += int64(len(data))
+	return nil
 }
 
 // Size returns the total size of the archive in bytes.

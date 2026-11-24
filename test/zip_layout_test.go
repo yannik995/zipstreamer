@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 type upstream struct {
 	files        map[string][]byte
 	ignoreRanges bool
+	chunked      bool // ignore ranges and send without Content-Length
 	hits         atomic.Int64
 	server       *httptest.Server
 }
@@ -35,6 +37,14 @@ func newUpstream(t *testing.T, files map[string][]byte) *upstream {
 		data, ok := u.files[r.URL.Path]
 		if !ok {
 			http.NotFound(w, r)
+			return
+		}
+		if u.chunked {
+			// Flushing before the end forces chunked transfer encoding.
+			half := len(data) / 2
+			w.Write(data[:half])
+			w.(http.Flusher).Flush()
+			w.Write(data[half:])
 			return
 		}
 		if u.ignoreRanges {
@@ -217,9 +227,10 @@ func mustParse(t *testing.T, desc []byte) *zip_streamer.ZipDescriptor {
 	return zd
 }
 
-func testRanges(t *testing.T, ignoreRanges bool) {
+func testRanges(t *testing.T, ignoreRanges bool, chunked bool) {
 	u, _, desc := setupSized(t)
 	u.ignoreRanges = ignoreRanges
+	u.chunked = chunked
 	full := doRequest(t, "GET", desc, nil).Body.Bytes()
 	size := len(full)
 
@@ -260,11 +271,11 @@ func testRanges(t *testing.T, ignoreRanges bool) {
 }
 
 func TestSizedDownloadRanges(t *testing.T) {
-	testRanges(t, false)
+	testRanges(t, false, false)
 }
 
 func TestSizedDownloadRangesUpstreamIgnoresRanges(t *testing.T) {
-	testRanges(t, true)
+	testRanges(t, true, false)
 }
 
 func TestSizedDownloadMultipartRanges(t *testing.T) {
@@ -580,5 +591,102 @@ func TestZip64LargeFilesViaRanges(t *testing.T) {
 	data, err := io.ReadAll(rc)
 	if err != nil || !bytes.Equal(data, make([]byte, 10)) {
 		t.Errorf("small file: %v", err)
+	}
+}
+
+func TestSizedDownloadRangesChunkedUpstream(t *testing.T) {
+	testRanges(t, false, true)
+}
+
+func TestSizedDownloadChunkedUpstreamExactSize(t *testing.T) {
+	u, files, desc := setupSized(t)
+	u.chunked = true
+	rr := doRequest(t, "GET", desc, nil)
+	checkHttpOk(rr, t)
+	verifyZip(t, rr.Body.Bytes(), files)
+}
+
+func TestSizedDownloadChunkedUpstreamOversizedFails(t *testing.T) {
+	u, _, desc := setupSized(t)
+	u.chunked = true
+	// Upstream file grew after the descriptor was created. Without a
+	// Content-Length this can only be detected at the declared end.
+	u.files["/big.bin"] = append(append([]byte{}, u.files["/big.bin"]...), 'X')
+
+	zs := httptest.NewServer(zip_streamer.NewServer())
+	defer zs.Close()
+	resp, err := http.Post(zs.URL+"/download", "application/json", bytes.NewReader(desc))
+	if err != nil {
+		return // connection error is fine
+	}
+	defer resp.Body.Close()
+	if _, err := io.ReadAll(resp.Body); err == nil {
+		t.Errorf("expected truncated response error for oversized chunked upstream")
+	}
+}
+
+func TestZipLayoutRejectsSizeOverflow(t *testing.T) {
+	cases := [][]int64{
+		{math.MaxInt64},
+		{math.MaxInt64 / 2, math.MaxInt64 / 2},
+		{math.MaxInt64 - 100},
+	}
+	for _, sizes := range cases {
+		entries := []*zip_streamer.FileEntry{}
+		for i, size := range sizes {
+			e, _ := zip_streamer.NewFileEntry("https://example.com/f", fmt.Sprintf("f%d", i))
+			if err := e.SetSize(size); err != nil {
+				t.Fatal(err)
+			}
+			e.SetCRC32(0)
+			entries = append(entries, e)
+		}
+		if l, err := zip_streamer.NewZipLayout(entries); err == nil {
+			t.Errorf("sizes %v: expected error, got layout of size %d", sizes, l.Size())
+		}
+	}
+
+	// create_download_link must not report a bogus size
+	desc := []byte(`{"files":[{"url":"https://example.com/a","zipPath":"a","size":9223372036854775807,"crc32":"0"}]}`)
+	rr := httptest.NewRecorder()
+	zip_streamer.NewServer().ServeHTTP(rr, httptest.NewRequest("POST", "/create_download_link", bytes.NewReader(desc)))
+	if strings.Contains(rr.Body.String(), "size") {
+		t.Errorf("unexpected size in response: %s", rr.Body.String())
+	}
+}
+
+func TestCORSAllowsRangeHeaders(t *testing.T) {
+	server := zip_streamer.NewServer()
+
+	req := httptest.NewRequest("OPTIONS", "/download_link/x", nil)
+	req.Header.Set("Origin", "https://example.com")
+	req.Header.Set("Access-Control-Request-Method", "GET")
+	req.Header.Set("Access-Control-Request-Headers", "range,if-range")
+	rr := httptest.NewRecorder()
+	server.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("preflight status %d", rr.Code)
+	}
+	allowed := rr.Result().Header.Get("Access-Control-Allow-Headers")
+	if !strings.Contains(allowed, "Range") || !strings.Contains(allowed, "If-Range") {
+		t.Errorf("Access-Control-Allow-Headers = %q", allowed)
+	}
+
+	_, _, desc := setupSized(t)
+	rr = httptest.NewRecorder()
+	server.ServeHTTP(rr, httptest.NewRequest("POST", "/create_download_link", bytes.NewReader(desc)))
+	var resp struct {
+		LinkId string `json:"link_id"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	req = httptest.NewRequest("HEAD", "/download_link/"+resp.LinkId, nil)
+	req.Header.Set("Origin", "https://example.com")
+	rr = httptest.NewRecorder()
+	server.ServeHTTP(rr, req)
+	exposed := rr.Result().Header.Get("Access-Control-Expose-Headers")
+	for _, h := range []string{"Etag", "Accept-Ranges", "Content-Range"} {
+		if !strings.Contains(exposed, h) {
+			t.Errorf("Access-Control-Expose-Headers = %q, missing %s", exposed, h)
+		}
 	}
 }

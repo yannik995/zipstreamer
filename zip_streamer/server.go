@@ -42,9 +42,13 @@ func NewServer() *Server {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	originsOk := handlers.AllowedOrigins([]string{"*"})
-	headersOk := handlers.AllowedHeaders([]string{"Content-Type", "X-Requested-With", "*"})
+	// Range and If-Range enable cross-origin resumable downloads. Note that
+	// gorilla/handlers treats "*" as a literal header name, not a wildcard.
+	headersOk := handlers.AllowedHeaders([]string{"Content-Type", "X-Requested-With", "Range", "If-Range", "*"})
 	methodsOk := handlers.AllowedMethods([]string{"GET", "HEAD", "POST", "PUT", "OPTIONS"})
-	handlers.CORS(originsOk, headersOk, methodsOk)(s.router).ServeHTTP(w, r)
+	// Let cross-origin scripts read the headers needed to resume downloads.
+	exposedOk := handlers.ExposedHeaders([]string{"ETag", "Accept-Ranges", "Content-Range"})
+	handlers.CORS(originsOk, headersOk, methodsOk, exposedOk)(s.router).ServeHTTP(w, r)
 }
 
 func (s *Server) HandleCreateLink(w http.ResponseWriter, req *http.Request) {
